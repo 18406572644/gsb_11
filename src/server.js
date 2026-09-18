@@ -74,15 +74,58 @@ function createChatServer(overrides = {}) {
 
   // ---------------------------------------------------------------- 消息处理
 
-  /** 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉 */
+  /**
+   * 断线补发 / 背压恢复后的缺口回放：把 roomId 中 seq > fromSeq 的消息按序推给连接，
+   * 分批，客户端按 sync_done 续拉。
+   *
+   * 若连接正处于背压暂停态，不强行推送（只会堆进缓冲区），仅登记缺口房间；
+   * 待 ACK/缓冲排水、连接恢复时由 hub.onDrain 从投递游标 conn.roomProgress 重新回放。
+   */
   function replayRoom(conn, roomId, fromSeq) {
+    if (conn.paused) {
+      conn.blockedRooms.add(roomId);
+      return;
+    }
+    // 不得早于本连接已实际投递到的水位：ACK 恢复重放与客户端排队的 sync 请求可能同时
+    // 指向同一缺口，钳制到 roomProgress 可避免重复下发（客户端虽按 seq 幂等，也不浪费）。
+    const delivered = conn.roomProgress.get(roomId);
+    if (delivered !== undefined && fromSeq < delivered) fromSeq = delivered;
+    // 记录回放起点：即使本批一条都没发成就再次触发背压，恢复后也能从正确游标补起
+    conn.advanceProgress(roomId, fromSeq);
     const batch = db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
-    const hasMore = batch.length > config.syncBatchSize;
-    const slice = hasMore ? batch.slice(0, config.syncBatchSize) : batch;
-    for (const m of slice) hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq });
-    const lastSeq = slice.length ? slice[slice.length - 1].seq : fromSeq;
-    hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore });
+    const dbHasMore = batch.length > config.syncBatchSize;
+    const slice = dbHasMore ? batch.slice(0, config.syncBatchSize) : batch;
+    let lastSeq = fromSeq;
+    let truncated = false;
+    for (const m of slice) {
+      if (!hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq })) {
+        // 回放途中触发背压被跳过：以实际投递水位截断本批，剩余的等暂停恢复后再补，
+        // 绝不能用批次名义末 seq 回报，否则客户端续拉会跳过缺口造成永久空洞。
+        truncated = true;
+        break;
+      }
+      lastSeq = m.seq;
+    }
+    // sync_done 是控制帧，即使回放途中连接切入暂停也照常下发（客户端据此决定是否续拉）
+    hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore: dbHasMore || truncated });
   }
+
+  /**
+   * 背压恢复回调：连接排水到低水位后，按「该连接私有的投递游标」回放暂停期间错过的房间。
+   * 游标取自 conn.roomProgress（本连接最后实际投递到的 seq），与用户级确认游标相互独立，
+   * 因此同一用户其他设备 ACK 得再快，也不会让本连接漏补或错补。
+   */
+  hub.onDrain = (conn, blockedRooms) => {
+    for (const roomId of blockedRooms) {
+      if (!conn.rooms.has(roomId)) continue;
+      const fromSeq = conn.roomProgress.has(roomId)
+        ? conn.roomProgress.get(roomId)
+        : db.getCursor(roomId, conn.userId);
+      // 始终走 replayRoom：无缺口时它也会回 sync_done(lastSeq, hasMore=false)，
+      // 覆盖客户端在暂停期间主动发起 sync 请求、恢复时已追平的场景（请求必有响应）。
+      replayRoom(conn, roomId, fromSeq);
+    }
+  };
 
   function requireMember(conn, roomId) {
     const member = db.getMember(roomId, conn.userId);
@@ -179,6 +222,9 @@ function createChatServer(overrides = {}) {
       if (!conn.rooms.has(msg.roomId)) return; // 只处理本连接已加入的房间
       conn.ack(msg.roomId, msg.seq);
       db.saveCursor(msg.roomId, conn.userId, msg.seq);
+      // ACK 是慢连接最主要的排水信号：积压回落到低水位即恢复本连接推送并补齐缺口，
+      // 仅影响这一条连接；同用户其他设备各有独立的暂停/恢复状态。
+      hub.tryResume(conn);
     },
 
     sync(conn, msg) {
@@ -380,6 +426,7 @@ function createChatServer(overrides = {}) {
   const timers = [
     setInterval(() => hub.heartbeatSweep(), config.heartbeatIntervalMs),
     setInterval(() => hub.resendSweep(), config.ackResendIntervalMs),
+    setInterval(() => hub.backpressureSweep(), config.backpressureCheckIntervalMs),
   ];
   for (const t of timers) t.unref();
 

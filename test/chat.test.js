@@ -106,6 +106,46 @@ async function joinRoom(client, room, lastSeq = 0) {
   return client.waitFor((m) => m.type === 'joined');
 }
 
+const withTimeout = (p, ms, label) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout: ${label}`)), ms))]);
+
+/** 服务端侧：某用户的全部连接对象（用于断言连接级背压状态） */
+function serverConns(server, userId) {
+  return [...server.hub.all].filter((c) => c.userId === userId).sort((a, b) => a.id - b.id);
+}
+
+/**
+ * 让客户端对某房间的每条 msg 自动累积 ACK（模拟消费正常的快设备）。
+ * 直接挂在底层 ws 上，与 Client.waitFor 的消费互不干扰。返回停止函数。
+ */
+function autoAck(client, roomId) {
+  const handler = (raw) => {
+    const m = JSON.parse(raw.toString());
+    if (m.type === 'msg' && m.roomId === roomId) {
+      client.send({ type: 'ack', roomId, seq: m.seq });
+    }
+  };
+  client.ws.on('message', handler);
+  return () => client.ws.off('message', handler);
+}
+
+const range1 = (n) => Array.from({ length: n }, (_, i) => i + 1);
+
+/**
+ * 让客户端在收到 hasMore=true 的 sync_done 时自动续拉下一批（真实客户端行为，
+ * 见 public/index.html 的 sync_done 处理）。返回停止函数。
+ */
+function autoSync(client, roomId) {
+  const handler = (raw) => {
+    const m = JSON.parse(raw.toString());
+    if (m.type === 'sync_done' && m.roomId === roomId && m.hasMore) {
+      client.send({ type: 'sync', roomId, lastSeq: m.lastSeq });
+    }
+  };
+  client.ws.on('message', handler);
+  return () => client.ws.off('message', handler);
+}
+
 // ---------------------------------------------------------------- 测试用例
 
 test('登录、连接、建房后成为管理员', async () => {
@@ -444,5 +484,201 @@ test('持久化：服务重启后消息不丢失', async () => {
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- 背压：连接维度
+
+test('背压按连接隔离：同用户慢设备被暂停时，快设备仍实时消费', async () => {
+  const { server, port } = await startServer({ maxUnackedPerConn: 5 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const sender = await Client.connect(port, ub.token); // bob 持续发消息
+    const slow = await Client.connect(port, ua.token); // alice 设备 1：从不 ACK
+    const fast = await Client.connect(port, ua.token); // alice 设备 2：每条都 ACK
+    const roomId = await createRoom(sender, 'bp');
+    await joinRoom(slow, roomId);
+    await joinRoom(fast, roomId);
+    // 发送者也会收到自己消息的广播回包，真实客户端会累积 ACK；测试中同样自动确认，
+    // 否则发送者自己也会触发连接级背压（广播含回包）干扰场景。
+    const stopAutoAckSender = autoAck(sender, roomId);
+    const stopAutoAck = autoAck(fast, roomId);
+    // 映射到服务端连接对象（按建立顺序：慢设备先连）
+    const [slowConn, fastConn] = serverConns(server, ua.userId);
+
+    // 产生 15 条消息
+    for (let i = 1; i <= 15; i++) {
+      sender.send({ type: 'msg', roomId, clientMsgId: `t${i}`, content: `m${i}` });
+    }
+    await sender.waitFor((m) => m.type === 'ack' && m.clientMsgId === 't15', 5000);
+
+    // 慢设备在第 6 条处进入暂停
+    await withTimeout(
+      (async () => { while (!slowConn.paused) await sleep(10); })(),
+      3000,
+      'slow paused'
+    );
+
+    // 快设备实时收齐全部 15 条，且从未被暂停
+    await fast.waitFor((m) => m.type === 'msg' && m.roomId === roomId && m.seq === 15, 5000);
+    assert.deepEqual(fast.roomSeqs(roomId), range1(15));
+    assert.equal(fastConn.paused, false, '快设备不应被慢设备牵连进入背压');
+
+    // 慢设备只收过高水位以内的消息，未 ACK 积压有界，缺口已被标记待补
+    assert.equal(slowConn.unackedCount, 5, '暂停后未 ACK 积压不得继续增长');
+    assert.ok(slow.roomSeqs(roomId).length <= 6);
+    assert.ok(slowConn.blockedRooms.has(roomId));
+
+    stopAutoAck();
+    stopAutoAckSender();
+    await sender.close();
+    await slow.close();
+    await fast.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('慢设备 ACK 排水后自动恢复，暂停期间缺口经重放补齐且不重复', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 5,
+    backpressureResumeRatio: 0.4, // 低水位 = 2 条
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const sender = await Client.connect(port, ub.token);
+    const slow = await Client.connect(port, ua.token);
+    const roomId = await createRoom(sender, 'drain');
+    await joinRoom(slow, roomId);
+    const stopAutoAckSender = autoAck(sender, roomId); // 发送者同样 ACK 自己的广播回包
+    const [slowConn] = serverConns(server, ua.userId);
+
+    // 前 6 条：慢设备收 1..5 后在第 6 条处暂停
+    for (let i = 1; i <= 6; i++) {
+      sender.send({ type: 'msg', roomId, clientMsgId: `d${i}`, content: `m${i}` });
+    }
+    await sender.waitFor((m) => m.type === 'ack' && m.clientMsgId === 'd6', 5000);
+    await withTimeout(
+      (async () => { while (!slowConn.paused) await sleep(10); })(),
+      3000,
+      'pause'
+    );
+    assert.deepEqual(slow.roomSeqs(roomId), [1, 2, 3, 4, 5]);
+
+    // 暂停期间再产生 7..10，慢设备实时通道收不到
+    for (let i = 7; i <= 10; i++) {
+      sender.send({ type: 'msg', roomId, clientMsgId: `d${i}`, content: `m${i}` });
+    }
+    await sender.waitFor((m) => m.type === 'ack' && m.clientMsgId === 'd10', 5000);
+    await sleep(100);
+    assert.deepEqual(slow.roomSeqs(roomId), [1, 2, 3, 4, 5]);
+
+    // 排水：累积 ACK 到 seq=4（仅剩 seq5 一条 < 低水位 2）→ 恢复并从投递游标重放。
+    // 回放容量 = 高水位 5 - 剩余积压 1 = 4 条：本批只能补 6..9，seq10 再次触顶被截断，
+    // sync_done(hasMore=true) —— 与真实客户端一致，ACK 本批后续拉下一批。
+    slow.send({ type: 'ack', roomId, seq: 4 });
+    const batch1 = await slow.waitFor(
+      (m) => m.type === 'sync_done' && m.roomId === roomId && m.hasMore === true,
+      5000
+    );
+    assert.equal(batch1.lastSeq, 9);
+    assert.deepEqual(slow.roomSeqs(roomId), range1(9));
+
+    // ACK 掉回放批次（含 seq5..9）排水 → 自动重放最后一条 seq10
+    slow.send({ type: 'ack', roomId, seq: 9 });
+    const batch2 = await slow.waitFor(
+      (m) => m.type === 'sync_done' && m.roomId === roomId && m.hasMore === false,
+      5000
+    );
+    assert.equal(batch2.lastSeq, 10);
+    assert.deepEqual(slow.roomSeqs(roomId), range1(10), '暂停期间缺口完整补齐、按序无重复');
+
+    // 恢复后新消息恢复实时投递
+    sender.send({ type: 'msg', roomId, clientMsgId: 'd11', content: 'after' });
+    await slow.waitFor((m) => m.type === 'msg' && m.roomId === roomId && m.seq === 11, 3000);
+    assert.deepEqual(slow.roomSeqs(roomId), range1(11));
+
+    stopAutoAckSender();
+    await sender.close();
+    await slow.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('暂停超宽限只断开慢连接：同账号其他设备不断、游标不损坏，慢设备重连补发完好', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 3,
+    backpressureTimeoutMs: 300,
+    backpressureCheckIntervalMs: 50,
+    heartbeatTimeoutMs: 60_000,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const sender = await Client.connect(port, ub.token);
+    const slow = await Client.connect(port, ua.token);
+    const fast = await Client.connect(port, ua.token);
+    const roomId = await createRoom(sender, 'kill');
+    await joinRoom(slow, roomId);
+    await joinRoom(fast, roomId);
+    // 发送者也会收到自己消息的广播回包，真实客户端会累积 ACK；测试中同样自动确认，
+    // 否则发送者自己也会触发连接级背压（广播含回包）干扰场景。
+    const stopAutoAckSender = autoAck(sender, roomId);
+    const stopAutoAck = autoAck(fast, roomId);
+    const [slowConn, fastConn] = serverConns(server, ua.userId);
+
+    // 慢设备 3 条未 ACK → 第 4 条时暂停；快设备每条都 ACK（推进 per-user 游标）
+    for (let i = 1; i <= 4; i++) {
+      sender.send({ type: 'msg', roomId, clientMsgId: `k${i}`, content: `m${i}` });
+    }
+    await sender.waitFor((m) => m.type === 'ack' && m.clientMsgId === 'k4', 5000);
+    await withTimeout(
+      (async () => { while (!slowConn.paused) await sleep(10); })(),
+      3000,
+      'slow pause'
+    );
+    await fast.waitFor((m) => m.type === 'msg' && m.roomId === roomId && m.seq === 4, 5000);
+
+    // 等慢设备被宽限超时 terminate
+    await withTimeout(slow.closed, 3000, 'slow closed');
+    assert.equal(fast.ws.readyState, 1, '同账号快设备连接必须保持 OPEN');
+    assert.equal(fastConn.paused, false);
+
+    // 断开只摘慢设备：close 事件清理后，Hub 中同账号仍恰好剩快设备一条连接
+    await withTimeout(
+      (async () => {
+        while (serverConns(server, ua.userId).some((c) => c.id === slowConn.id)) await sleep(10);
+      })(),
+      2000,
+      'slow removed from hub'
+    );
+    assert.deepEqual(serverConns(server, ua.userId).map((c) => c.id), [fastConn.id]);
+
+    // 慢设备被断开期间继续产生消息，快设备照常实时消费
+    sender.send({ type: 'msg', roomId, clientMsgId: 'k5', content: 'm5' });
+    await fast.waitFor((m) => m.type === 'msg' && m.roomId === roomId && m.seq === 5, 5000);
+
+    // 慢设备重连：它此前从未 ACK 过，携带本地进度 lastSeq=0，必须完整收到 1..5。
+    // 即使 per-user 游标已被快设备推进到 4/5，也以它自己上报的进度为准，不丢消息。
+    // 重连后按真实客户端行为：对收到的 msg 累积 ACK、hasMore 时自动续拉。
+    const reborn = await Client.connect(port, ua.token);
+    const stopRebornAck = autoAck(reborn, roomId);
+    const stopRebornSync = autoSync(reborn, roomId);
+    await joinRoom(reborn, roomId, 0);
+    await reborn.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId && m.hasMore === false, 5000);
+    assert.deepEqual(reborn.roomSeqs(roomId), range1(5));
+
+    stopAutoAck();
+    stopAutoAckSender();
+    stopRebornAck();
+    stopRebornSync();
+    await sender.close();
+    await fast.close();
+    await reborn.close();
+  } finally {
+    server.stop();
   }
 });
