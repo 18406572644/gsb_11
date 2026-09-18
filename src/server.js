@@ -74,14 +74,27 @@ function createChatServer(overrides = {}) {
 
   // ---------------------------------------------------------------- 消息处理
 
-  /** 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉 */
+  /**
+   * 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉。
+   * 返回 {lastSeq, hasMore}。若推送途中本连接触发背压暂停（积压未确认），立即截断本批：
+   * lastSeq 只报到实际投递的位置 —— 客户端从该点续拉，未投部分绝不虚报为已同步。
+   */
   function replayRoom(conn, roomId, fromSeq) {
     const batch = db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
     const hasMore = batch.length > config.syncBatchSize;
     const slice = hasMore ? batch.slice(0, config.syncBatchSize) : batch;
-    for (const m of slice) hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq });
-    const lastSeq = slice.length ? slice[slice.length - 1].seq : fromSeq;
+    let lastSeq = fromSeq;
+    for (const m of slice) {
+      if (!hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq })) {
+        // 背压暂停：后续帧同样发不出去（send 会持续丢弃）。如实上报已投递位置与
+        // 缺口存在；客户端续拉会收到 BACKPRESSURE，等 backpressure:resume 后再补
+        hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore: true });
+        return { lastSeq, hasMore: true };
+      }
+      lastSeq = m.seq;
+    }
     hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore });
+    return { lastSeq, hasMore };
   }
 
   function requireMember(conn, roomId) {
@@ -131,9 +144,12 @@ function createChatServer(overrides = {}) {
         mutedUntil: member.muted_until,
         lastSeq: room.last_seq,
       });
-      // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
-      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
-      if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
+      // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）。
+      // 暂停态下 joinRoom 已把房间登记进 resume 重同步集合，回放会被丢弃故跳过
+      if (!conn.paused) {
+        const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
+        if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
+      }
     },
 
     leave(conn, msg) {
@@ -173,17 +189,20 @@ function createChatServer(overrides = {}) {
       }
     },
 
-    // 客户端累积 ACK：清除未确认队列 + 持久化游标（断线补发的兜底依据）
+    // 客户端累积 ACK：清除未确认队列 + 持久化游标（断线补发的兜底依据）。
+    // applyAck 同时驱动背压恢复：排空到恢复水位时自动 resume 并要求该连接重同步
     ack(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128) || !Number.isInteger(msg.seq)) return;
       if (!conn.rooms.has(msg.roomId)) return; // 只处理本连接已加入的房间
-      conn.ack(msg.roomId, msg.seq);
+      hub.applyAck(conn, msg.roomId, msg.seq);
       db.saveCursor(msg.roomId, conn.userId, msg.seq);
     },
 
     sync(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
       requireMember(conn, msg.roomId);
+      // 背压暂停中补发只会再次堆进同一条慢连接：拒绝并让客户端等 backpressure:resume
+      if (conn.paused) fail('BACKPRESSURE', 'connection paused, wait for resume then sync');
       const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(msg.roomId, conn.userId);
       replayRoom(conn, msg.roomId, fromSeq);
     },
@@ -380,6 +399,7 @@ function createChatServer(overrides = {}) {
   const timers = [
     setInterval(() => hub.heartbeatSweep(), config.heartbeatIntervalMs),
     setInterval(() => hub.resendSweep(), config.ackResendIntervalMs),
+    setInterval(() => hub.backpressureSweep(), config.backpressureSweepMs),
   ];
   for (const t of timers) t.unref();
 

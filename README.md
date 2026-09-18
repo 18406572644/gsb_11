@@ -7,7 +7,7 @@
 - **断线补发**：重连后按 `lastSeq` 增量回放缺口，分批拉取
 - **幂等去重**：`clientMsgId` 唯一约束防发送重试产生重复；客户端按 `seq` 过滤重复投递
 - **消息时序可控**：每房间单调递增 `seq`，由计数器在写事务内分配，保证房间内全序
-- **连接管理**：心跳保活、全局/单用户连接数上限、背压断开、优雅退出
+- **连接管理**：心跳保活、全局/单用户连接数上限、按连接维度的三级背压（暂停推送 → 恢复重同步 → 断开慢连接）、优雅退出
 - **房间权限**：管理员 / 成员 / 禁言三种状态，管理员可禁言、解禁
 - **发送限流**：按用户令牌桶
 
@@ -16,7 +16,7 @@
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 17 个集成测试
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
@@ -88,6 +88,30 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
 
+### 6. 背压：按连接维度的三阶段处置
+
+未 ACK 积压严格以**连接**（设备）为单位统计，而非用户：同一账号多台设备同时在线时，
+一台设备读取缓慢只影响它自己，其他设备照常实时消费。处置分三级递进：
+
+1. **暂停推送（软上限）**：某连接的未 ACK 消息数达到 `MAX_UNACKED_PER_CONN` 时，
+   服务端只对这条连接**暂停实时推送**——后续广播对该连接直接丢弃、不入内存队列，
+   积压被钉死在上限附近，不会无限增长占满内存；同时下发
+   `{type:'backpressure', state:'paused', limit, unacked}`。控制帧（ack/error/
+   joined 等）与其他连接不受影响。
+2. **恢复 + 重新同步**：客户端继续回累积 ACK，积压排空到恢复水位
+   （`MAX_UNACKED_PER_CONN × BACKPRESSURE_RESUME_RATIO`，默认一半）后，服务端下发
+   `{type:'backpressure', state:'resume', rooms}`，客户端按**自己本地**的
+   `lastSeenSeq` 对列表中的房间逐个 `sync` 补齐缺口。不使用按用户保存的服务端游标
+   续推——该游标可能已被同账号其他设备推进；每台设备只补自己错过的洞。
+3. **断开慢连接（宽限期）**：暂停状态持续超过 `BACKPRESSURE_DISCONNECT_MS`
+   （默认 30s，说明客户端始终不 ACK），服务端以 1013（Try Again Later）**只关闭这
+   一条连接**：不触碰同账号其他设备、不改变房间成员关系、不修改任何消息游标。
+   客户端重连后重新 `join`，走既有 sync 协议按本地进度补发。
+
+补发批次（`replayRoom`）同样受背压约束：一批回放途中触发暂停即截断，`sync_done`
+只如实上报已投递到的 `lastSeq` 且 `hasMore=true`，客户端从该点续拉；暂停期间主动
+`sync` 会收到 `BACKPRESSURE` 错误，应等待 `resume`。
+
 ## 协议（JSON 文本帧）
 
 ### 客户端 → 服务端
@@ -116,13 +140,14 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `msg` | 房间消息：`{roomId, seq, clientMsgId, from, fromName, content, ts}` |
 | `ack` | 发送确认：`{roomId, clientMsgId, seq, ts}` |
 | `sync_done` | 一批补发结束：`{roomId, lastSeq, hasMore}` |
+| `backpressure` | 本连接背压状态：`{state:'paused', limit, unacked}` / `{state:'resume', rooms:[roomId]}` |
 | `history` / `rooms` / `members` | 对应查询的响应 |
 | `notice` | 房间事件（`muted` / `unmuted`） |
 | `error` | `{code, message, ref?}`，code 见下 |
 | `server_shutdown` | 服务即将关闭，请准备重连 |
 
 错误码：`BAD_FRAME` `BAD_REQUEST` `UNKNOWN_TYPE` `NOT_MEMBER` `NO_SUCH_ROOM`
-`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`；
+`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `BACKPRESSURE` `INTERNAL`；
 升级阶段拒绝：`401`（认证失败）、`503 SERVER_FULL` / `503 TOO_MANY_DEVICES`。
 
 ### 连接建立
@@ -142,7 +167,10 @@ GET  /ws?token=<token>            →  WebSocket 升级
 | `MAX_CONNECTIONS_PER_USER` | `3` | 单用户连接上限（多端） |
 | `HEARTBEAT_INTERVAL_MS` / `HEARTBEAT_TIMEOUT_MS` | `30000` / `75000` | 心跳周期 / 判死超时 |
 | `ACK_RESEND_AFTER_MS` / `ACK_MAX_RESEND` | `3000` / `5` | 未 ACK 重发阈值 / 最大次数 |
-| `MAX_UNACKED_PER_CONN` | `1000` | 单连接未确认积压上限（背压） |
+| `MAX_UNACKED_PER_CONN` | `1000` | 单连接未确认积压软上限（背压，按连接计） |
+| `BACKPRESSURE_RESUME_RATIO` | `0.5` | 积压排空到软上限的该比例以下时恢复推送 |
+| `BACKPRESSURE_DISCONNECT_MS` | `30000` | 暂停宽限期：持续未排空则断开该慢连接（1013） |
+| `BACKPRESSURE_SWEEP_MS` | `2000` | 背压宽限扫描周期 |
 | `RATE_LIMIT_PER_SEC` / `RATE_LIMIT_BURST` | `10` / `20` | 发送限流令牌桶 |
 | `SYNC_BATCH_SIZE` | `500` | 补发单批条数 |
 | `AUTH_SECRET` | — | token HMAC 密钥，**生产必须设置** |

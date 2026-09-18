@@ -174,6 +174,20 @@ function handle(m) {
     case 'sync_done':
       if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
       break;
+    case 'backpressure': {
+      // 服务端按「本连接」维度的背压处置：paused=实时推送已暂停（继续 ACK 即可），
+      // resume=已恢复，按本地进度对暂停期间错过的房间逐个 sync 补洞
+      if (m.state === 'paused') {
+        sys(currentRoom, `接收背压：实时推送已暂停（未确认 ${m.unacked}/${m.limit}），确认后自动恢复并补全`);
+      } else if (m.state === 'resume') {
+        for (const roomId of m.rooms || []) {
+          const r = rooms.get(roomId);
+          if (r) send({ type: 'sync', roomId, lastSeq: r.lastSeenSeq || 0 });
+        }
+        sys(currentRoom, '实时推送已恢复，正在补齐暂停期间错过的消息…');
+      }
+      break;
+    }
     case 'notice': {
       const r = rooms.get(m.roomId);
       if (r && m.userId === me.userId) r.mutedUntil = m.event === 'muted' ? m.until : 0;
@@ -185,7 +199,8 @@ function handle(m) {
       if (m.roomId === currentRoom) renderMembers(m.members);
       break;
     case 'error':
-      sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      // 暂停期间自动续拉可能收到 BACKPRESSURE：等 backpressure:resume 后会再 sync，无需打扰用户
+      if (m.code !== 'BACKPRESSURE') sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
     case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
   }

@@ -36,8 +36,10 @@ async function login(port, name) {
 
 /** 测试客户端：手动 ACK（测试可控）。log 全量记录供断言；waitFor 消费式匹配（每帧至多满足一个等待者） */
 class Client {
-  static async connect(port, token) {
+  static async connect(port, token, { autoAck = false } = {}) {
     const c = new Client();
+    c.autoAck = autoAck; // 自动累积 ACK（模拟正常消费的快设备）
+    c.closeCode = null;
     c.log = []; // 全部帧（断言用）
     c.pending = []; // 未被 waitFor 消费的帧
     c.waiters = [];
@@ -46,6 +48,7 @@ class Client {
     c.ws.on('message', (raw) => {
       const m = JSON.parse(raw.toString());
       c.log.push(m);
+      if (autoAck && m.type === 'msg') c.send({ type: 'ack', roomId: m.roomId, seq: m.seq });
       for (const w of [...c.waiters]) {
         if (w.pred(m)) {
           c.waiters.splice(c.waiters.indexOf(w), 1);
@@ -56,7 +59,7 @@ class Client {
       }
       c.pending.push(m);
     });
-    c.ws.on('close', () => c._onClosed());
+    c.ws.on('close', (code) => { c.closeCode = code; c._onClosed(); });
     await new Promise((res, rej) => {
       c.ws.once('open', res);
       c.ws.once('error', rej);
@@ -446,3 +449,191 @@ test('持久化：服务重启后消息不丢失', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+async function sendBurst(a, roomId, n, start = 1) {
+  for (let i = start; i < start + n; i++) {
+    a.send({ type: 'msg', roomId, clientMsgId: `m${i}`, content: `msg ${i}` });
+  }
+  await a.waitFor((m) => m.type === 'ack' && m.clientMsgId === `m${start + n - 1}`);
+}
+
+test('背压：慢设备被暂停且积压被钉死，同账号快设备持续正常消费', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 10,
+    backpressureResumeRatio: 0.5,
+    backpressureDisconnectMs: 60_000, // 本用例不断开，只验证暂停
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token, { autoAck: true }); // 发送者正常 ACK 自己的广播回包
+    const slow = await Client.connect(port, ub.token); // 慢设备：不 ACK
+    const fast = await Client.connect(port, ub.token, { autoAck: true }); // 同账号快设备
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(slow, roomId);
+    await joinRoom(fast, roomId);
+
+    await sendBurst(a, roomId, 10); // 第一批恰好到软上限：快设备 ACK 排空，慢设备积压 10
+    await sleep(100);
+    await sendBurst(a, roomId, 5, 11); // 第二批：快设备照常收，慢设备在第 11 条处暂停
+    await fast.waitFor((m) => m.type === 'msg' && m.seq === 15);
+
+    const paused = await slow.waitFor((m) => m.type === 'backpressure' && m.state === 'paused');
+    assert.equal(paused.limit, 10);
+    assert.equal(paused.unacked, 10);
+
+    // 慢设备：只收到 1..10，11..15 在暂停期间被丢弃（不缓冲），积压钉死在上限
+    assert.deepEqual(slow.roomSeqs(roomId), Array.from({ length: 10 }, (_, i) => i + 1));
+    await sleep(200);
+    assert.deepEqual(slow.roomSeqs(roomId).length, 10, '暂停期间不得继续向慢连接推送');
+
+    const bobConns = [...server.hub.all].filter((c) => c.userId === ub.userId);
+    const slowConn = bobConns.find((c) => c.paused);
+    const fastConn = bobConns.find((c) => !c.paused);
+    assert.ok(slowConn, '慢连接处于暂停态');
+    assert.equal(slowConn.unackedCount, 10, '慢连接未确认积压被钉死在上限');
+    assert.ok(fastConn, '同账号快连接不受影响');
+    assert.equal(fastConn.unackedCount, 0, '快连接 ACK 正常，无积压');
+
+    // 快设备 15 条全部实时消费，连接保持健康
+    assert.deepEqual(fast.roomSeqs(roomId), Array.from({ length: 15 }, (_, i) => i + 1));
+    assert.equal(fast.ws.readyState, 1);
+    assert.equal(server.hub.stats().paused, 1, '全房间只有慢连接一台处于暂停态');
+
+    await slow.close();
+    await fast.close();
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('背压恢复：ACK 排空到恢复水位后 resume，客户端 sync 补齐缺口', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 10,
+    backpressureResumeRatio: 0.5, // 恢复水位 5
+    backpressureDisconnectMs: 60_000,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+
+    await sendBurst(a, roomId, 12); // b 在第 11 条处暂停，只收到 1..10
+    await b.waitFor((m) => m.type === 'backpressure' && m.state === 'paused');
+
+    // 累积 ACK 到 seq 5：积压 10 -> 5，触达恢复水位
+    b.send({ type: 'ack', roomId, seq: 5 });
+    const resume = await b.waitFor((m) => m.type === 'backpressure' && m.state === 'resume');
+    assert.deepEqual(resume.rooms, [roomId], 'resume 须指明需要重同步的房间');
+
+    // 客户端按自己的本地进度（最后见到 seq 10）补洞，而非用服务端用户游标
+    b.send({ type: 'sync', roomId, lastSeq: 10 });
+    const done = await b.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
+    assert.equal(done.hasMore, false);
+    assert.deepEqual(b.roomSeqs(roomId), Array.from({ length: 12 }, (_, i) => i + 1), '缺口 11、12 补齐');
+
+    b.send({ type: 'ack', roomId, seq: 12 });
+    await sleep(50);
+    const conn = [...server.hub.all].find((c) => c.userId === ub.userId);
+    assert.equal(conn.paused, false);
+    assert.equal(conn.unackedCount, 0);
+    assert.equal(server.db.getCursor(roomId, ub.userId), 12, '游标机制正常推进');
+
+    await b.close();
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('背压断开：宽限期满只关慢连接（1013），其他设备、房间与游标均不受影响', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 5,
+    backpressureDisconnectMs: 200,
+    backpressureSweepMs: 50,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token, { autoAck: true });
+    const slow = await Client.connect(port, ub.token); // 慢设备
+    const fast = await Client.connect(port, ub.token, { autoAck: true }); // 同账号快设备
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(slow, roomId);
+    await joinRoom(fast, roomId);
+
+    await sendBurst(a, roomId, 5); // 第一批到软上限：快设备排空，慢设备积压 5
+    await sleep(100);
+    await sendBurst(a, roomId, 5, 6); // 第二批：慢设备在第 6 条处暂停
+    await fast.waitFor((m) => m.type === 'msg' && m.seq === 10);
+
+    const closeCode = await Promise.race([
+      slow.closed.then(() => slow.closeCode),
+      sleep(3000).then(() => null),
+    ]);
+    assert.equal(closeCode, 1013, '持续不排空的慢连接应被 1013 关闭');
+
+    // 同账号另一设备、发送者都保持在线
+    assert.equal(fast.ws.readyState, 1);
+    assert.equal(a.ws.readyState, 1);
+    assert.deepEqual(fast.roomSeqs(roomId), Array.from({ length: 10 }, (_, i) => i + 1));
+
+    // hub 中 bob 只剩快连接（等服务端处理完 close 事件）；游标停留在快设备 ACK
+    // 到的位置，断开未破坏游标
+    let bobConns;
+    for (let i = 0; i < 50; i++) {
+      bobConns = [...server.hub.all].filter((c) => c.userId === ub.userId);
+      if (bobConns.length === 1) break;
+      await sleep(20);
+    }
+    assert.equal(bobConns.length, 1, '只移除慢连接，同账号其他设备保留');
+    assert.equal(bobConns[0].paused, false);
+    assert.equal(server.db.getCursor(roomId, ub.userId), 10);
+
+    // 慢设备重连：重新 join 后按本地进度 sync 补齐缺口
+    const reconnected = await Client.connect(port, ub.token);
+    await joinRoom(reconnected, roomId, 5);
+    await reconnected.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
+    assert.deepEqual(reconnected.roomSeqs(roomId), [6, 7, 8, 9, 10], '重连补发完整');
+    assert.equal(server.db.getCursor(roomId, ub.userId), 10, '补发不回退游标');
+
+    await reconnected.close();
+    await fast.close();
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('背压截断补发：回放途中触发暂停时 sync_done 如实上报缺口', async () => {
+  const { server, port } = await startServer({
+    maxUnackedPerConn: 10,
+    backpressureResumeRatio: 0.5,
+    backpressureDisconnectMs: 60_000,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const roomId = await createRoom(a, 'general');
+    await sendBurst(a, roomId, 12); // 12 条历史消息
+
+    // 慢设备带着 lastSeq=0 入房：回放 1..10 后在第 11 条触发暂停并截断
+    const b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId, 0);
+    const done = await b.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
+    assert.equal(done.lastSeq, 10, '只如实上报实际投递到的位置');
+    assert.equal(done.hasMore, true, '未投部分必须报有缺口，由客户端续拉');
+    assert.deepEqual(b.roomSeqs(roomId), Array.from({ length: 10 }, (_, i) => i + 1));
+
+    await b.close();
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+

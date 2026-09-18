@@ -21,7 +21,16 @@ module.exports = {
   ackResendIntervalMs: Number(process.env.ACK_RESEND_INTERVAL_MS || 2_000), // 未 ACK 重发扫描周期
   ackResendAfterMs: Number(process.env.ACK_RESEND_AFTER_MS || 3_000), // 发送后多久未收到 ACK 触发重发
   ackMaxResend: Number(process.env.ACK_MAX_RESEND || 5), // 单条消息最大重发次数，超限断开连接
-  maxUnackedPerConn: Number(process.env.MAX_UNACKED_PER_CONN || 1_000), // 单连接未 ACK 积压上限（背压）
+
+  // 背压（严格按「连接」维度统计与处置，同一用户的多台设备互不影响）：
+  // 积压达到软上限后暂停向该连接实时推送（不缓冲，内存不再增长）；
+  // 收到 ACK 排空到 maxUnackedPerConn * backpressureResumeRatio 以下后恢复推送，
+  // 并通知客户端按本地进度 sync 补齐暂停期间错过的消息；
+  // 暂停持续超过宽限期仍未排空，则只断开这条慢连接（1013），重连后走 sync。
+  maxUnackedPerConn: Number(process.env.MAX_UNACKED_PER_CONN || 1_000), // 单连接未 ACK 积压软上限
+  backpressureResumeRatio: Number(process.env.BACKPRESSURE_RESUME_RATIO || 0.5), // 恢复水位占软上限比例
+  backpressureDisconnectMs: Number(process.env.BACKPRESSURE_DISCONNECT_MS || 30_000), // 暂停宽限期，超限断开慢连接
+  backpressureSweepMs: Number(process.env.BACKPRESSURE_SWEEP_MS || 2_000), // 背压扫描周期
 
   // 消息
   maxContentLength: Number(process.env.MAX_CONTENT_LENGTH || 4_000), // 单条消息最大字符数
